@@ -1,0 +1,368 @@
+---
+title: "502_project_Synthea_Team 1"
+author: "Huahua Cai"
+date: "12/2/2021"
+output: html_document
+---
+
+```{r}
+library(keyring)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(DBI) 
+library(RPostgres) 
+library(connections) 
+con <- connection_open(RPostgres::Postgres(),
+          dbname = "syntheticmguh",
+          host = "35.199.26.47",
+          user = "hids502_student",
+          password = key_get("35.199.26.47","hids502_student"),
+          bigint = "numeric")
+```
+
+## Introduction
+
+This file serves as a way to get the evidence for why the problem - multiple Covid tests being run for patients within 24 hours - should be improved. 
+
+We will look at 4 tables from the SyntheticMGUH data set - observations, organizations, encounters and patients. With these data, not only will we get the basic information about the situation, like the portion of patients who get tested multiple times within 24 hours, but we can also analyze the challenges we face from different angles.
+
+## A glance at the data
+### Covid records from the table 'observations'
+
+```{sql connection=con}
+DROP TABLE IF EXISTS temp_covid_record
+```
+
+```{sql connection = con}
+-- Save all covid records to a temp table
+WITH covid_record AS(  
+  SELECT ROW_NUMBER() OVER(PARTITION BY patient ORDER BY date ASC) AS row_num,
+    patient, date, value, encounter
+  FROM observations
+  WHERE description LIKE '%SARS-CoV%')  
+SELECT * INTO TEMP temp_covid_record FROM covid_record
+```
+
+```{sql connection = con}
+SELECT * FROM temp_covid_record
+```
+
+### Combine each record with organizations and encounter reasons
+
+```{sql connection = con}
+SELECT row_num, patient, date, value, encounter, 
+  a.reasondescription, a.encounterclass,
+  a.organization_name
+FROM temp_covid_record
+
+LEFT JOIN (
+  SELECT o.name AS organization_name, e.id, 
+    e.reasondescription, e.encounterclass 
+  FROM encounters e 
+  LEFT JOIN organizations o ON e.organization = o.id) a 
+ON temp_covid_record.encounter = a.id
+```
+
+### Check the patients' demographics (age, gender)
+
+```{sql connection = con}
+WITH demographics AS (
+  SELECT DISTINCT patient,
+    date_part('year', age(temp_covid_record.date, patients.birthdate)) as age,
+    patients.gender 
+  FROM temp_covid_record
+  LEFT JOIN patients ON temp_covid_record.patient = patients.id)
+SELECT AVG(age) AS mean_age, MIN(age) AS min_age, MAX(age) AS max_age, 
+  gender
+FROM demographics
+GROUP BY gender
+```
+## Data pre-processing - get the valid data
+### Extract the data frame using R
+
+```{r}
+sql_statement <- "
+WITH covid_record AS(  
+  SELECT ROW_NUMBER() OVER(PARTITION BY patient ORDER BY date ASC) AS row_num,
+    patient, date, value, encounter
+  FROM observations
+  WHERE description LIKE '%SARS-CoV%')
+  
+SELECT c.row_num, c.patient, c.date, c.value, c.encounter, 
+  a.organization_name, a.reasondescription AS encounter_reason,
+  a.encounterclass AS encounter_class
+FROM covid_record c
+
+LEFT JOIN (
+  SELECT o.name AS organization_name, e.id, 
+    e.reasondescription, e.encounterclass
+  FROM encounters e 
+  LEFT JOIN organizations o ON e.organization = o.id) a 
+ON c.encounter = a.id"
+df <- dbGetQuery(con, sql_statement)
+head(df)
+```
+
+### Get the list of patients with multiple records (not limited in 24 hours)
+
+```{r}
+patient_list <- unique(df$patient)
+patient_with_multiple_records = c()
+for (patient in patient_list){
+  if (dim(df[df$patient == patient,])[1] > 1){
+    patient_with_multiple_records <- c(patient_with_multiple_records, patient)
+  }
+}
+length(patient_with_multiple_records)
+```
+
+```{r}
+# Since most patients have no more than 3 records at a glance, 
+# we check for whether there exists 4 or more records for one patient
+patients_with_4_or_more_records = c()
+for (patient in patient_list){
+  if (dim(df[df$patient == patient,])[1] >= 4){
+    patients_with_4_or_more_records <- c(patients_with_4_or_more_records, patient)
+  }
+}
+patients_with_4_or_more_records
+```
+
+Therefore, there are 133 patients who have multiple records in the table 'observations'. Among them, no one has 4 or more records, which means that every one of the 133 patients has only 2 or 3 records related to COVID-19.
+
+
+### Get the records within 24 hours
+
+```{r}
+# First create empty vectors to store the result 
+patient_final = c()
+first_record_time = c()
+second_record_time = c()
+lag = c()
+first_result = c()
+second_result = c()
+first_organization = c()
+second_organizaion = c()
+first_encounter_reason = c()
+second_encounter_reason = c()
+first_encounter_class = c()
+second_encounter_class = c()
+
+# Looping through every record of every patient with multiple records
+for (patient in patient_with_multiple_records){
+  tmp_df = df[df$patient == patient,]
+  for (row in 1:(dim(tmp_df)[1]-1)){
+    # Calculate the time difference between two records, in hours 
+    a = difftime(tmp_df$date[row+1], tmp_df$date[row], units = 'hours')
+    # Check if the diff is within 24 hours
+    if (abs(as.double(a)) < 24 ){
+      patient_final <- c(patient_final,patient) # patients who have multiple records within 24 hours
+      first_record_time <- append(first_record_time, tmp_df$date[row])  
+      second_record_time <- append(second_record_time, tmp_df$date[row+1]) 
+      lag <- c(lag, abs(as.double(a)))
+      first_result <- append(first_result, tmp_df$value[row])
+      second_result <- append(second_result,tmp_df$value[row+1])
+      first_organization <- append(first_organization, tmp_df$organization_name[row])
+      second_organizaion <- append(second_organizaion, tmp_df$organization_name[row+1])
+      first_encounter_reason <- append(first_encounter_reason, tmp_df$encounter_reason[row])
+      second_encounter_reason <- append(second_encounter_reason, tmp_df$encounter_reason[row+1])
+      first_encounter_class <- append(first_encounter_class, tmp_df$encounter_class[row])
+      second_encounter_class <- append(second_encounter_class, tmp_df$encounter_class[row+1])
+    }
+  }
+}
+```
+
+```{r}
+within_24_hours_records <- data.frame(
+  Patient = patient_final, 
+  First_record_time = first_record_time, Second_record_time = second_record_time, 
+  Lag_time = lag, 
+  First_result = first_result, Second_result = second_result, 
+  First_organization = first_organization, 
+  Second_organization = second_organizaion,
+  First_encounter_reason = first_encounter_reason,
+  Second_encounter_reason = second_encounter_reason,
+  First_encounter_class = first_encounter_class,
+  Second_encounter_class = second_encounter_class
+)
+
+head(within_24_hours_records)
+```
+
+```{r}
+length(unique(within_24_hours_records$Patient))
+```
+
+We can see that there are 70 patients who have multiple records within 24 hours, and the number of records within this time period is all 2.
+
+## Data Analysis
+### Basic information - proportion of patients having tests in 24 hours
+
+```{r}
+length(unique(within_24_hours_records$Patient)) / length(patient_with_multiple_records)
+```
+
+Out of all the patients with multiple Covid records, 52.6% of them have the tests in 24 hours.
+
+### Basic information - lag time between tests
+
+```{r}
+summary(within_24_hours_records$Lag_time)
+```
+
+The minimum lag time between 2 records for one patient is 18 hours, while the maximum is 23 hours. Also, the median and mean are both around 20 hours.
+
+### Basic information - demographics of the patients
+
+```{r}
+sql_statement <- "
+WITH covid_record AS(  
+  SELECT ROW_NUMBER() OVER(PARTITION BY patient ORDER BY date ASC) AS row_num,
+    patient, date, value, encounter
+  FROM observations
+  WHERE description LIKE '%SARS-CoV%')
+  
+SELECT DISTINCT c.patient, patients.gender,
+  date_part('year', age(c.date, patients.birthdate)) as age 
+FROM covid_record c
+
+LEFT JOIN patients ON c.patient = patients.id"
+df_demographics <- dbGetQuery(con, sql_statement)
+```
+
+```{r}
+patient_age_list <- c()
+patient_gender_list <- c()
+for (index in 1:length(patient_final)){
+  # Since some patients have multiple records, we only extract their age shown in the first record
+  # As the period for COVID records is shorter than 1 year, the estimates would not be much affected
+  patient_age_list <- c(patient_age_list, df_demographics[df_demographics$patient == patient_final[index],]$age[1])
+  patient_gender_list <- c(patient_gender_list, df_demographics[df_demographics$patient == patient_final[index],]$gender[1])
+}
+patient_demographics <- data.frame(
+  patient = patient_final, 
+  gender = patient_gender_list, age = patient_age_list)
+```
+
+```{r}
+# All 70 patient's gender distribution
+table(patient_demographics$gender)
+```
+
+```{r}
+# All 70 patient's age distribution
+summary(patient_demographics$age)
+```
+
+```{r}
+# Age distribution in males
+summary(patient_demographics[patient_demographics$gender == 'M',]$age)
+```
+
+```{r}
+# Age distribution in females
+summary(patient_demographics[patient_demographics$gender == 'F',]$age)
+```
+
+### Basic information - encounter reason and class for the tests
+
+```{r}
+table(within_24_hours_records$First_encounter_reason)
+```
+
+```{r}
+table(within_24_hours_records$Second_encounter_reason)
+```
+
+```{r}
+table(within_24_hours_records$First_encounter_class)
+```
+
+```{r}
+table(within_24_hours_records$Second_encounter_class)
+```
+
+```{r}
+patient_with_same_encounter_reason <-c()
+for (row in 1:(dim(within_24_hours_records)[1])){
+  if (!is.na(within_24_hours_records$First_encounter_reason[row])&
+      !is.na(within_24_hours_records$Second_encounter_reason[row])){
+    if (within_24_hours_records$First_encounter_reason[row] == 
+        within_24_hours_records$Second_encounter_reason[row] ){
+      patient_with_same_encounter_reason <- 
+        c(patient_with_same_encounter_reason, 
+          within_24_hours_records$First_encounter_reason[row])
+    }
+  }
+}
+table(patient_with_same_encounter_reason)
+```
+
+```{r}
+patient_with_same_encounter_class <- c()
+for (row in 1:(dim(within_24_hours_records)[1])){
+  if (!is.na(within_24_hours_records$First_encounter_class[row])&
+      !is.na(within_24_hours_records$Second_encounter_class[row])){
+    if (within_24_hours_records$First_encounter_class[row] == 
+        within_24_hours_records$Second_encounter_class[row] ){
+      patient_with_same_encounter_class <- 
+        c(patient_with_same_encounter_class, 
+          within_24_hours_records$First_encounter_class[row])
+    }
+  }
+}
+table(patient_with_same_encounter_class)
+```
+
+We can see that most patients with multiple records within 24 hours are inpatients, and nearly every one of them come to the hospital for COVID-19. For the 2 tests they take, there is not much changing in their encounter reason and encounter class. 63/70 = 90% of them take the both of the two tests for COVID-19, and 63/70 = 90% of them encounter both two times as inpatients.
+
+### Other dimensions - getting tested in the same organization within 24 hours
+
+```{r}
+organization_list <- c()
+for (row in 1:(dim(within_24_hours_records)[1])){
+  if (within_24_hours_records$First_organization[row] == within_24_hours_records$Second_organization[row]){
+    organization_list <- c(organization_list, within_24_hours_records$First_organization[row])
+  }
+}
+table(organization_list)
+```
+
+```{r}
+table(df$organization_name)
+```
+
+In the records within 24 hours, we can see that there are 65 patients get tested twice in one same place - Medstar Georgetown University Hospital. However, it does not mean that only this hospital should take the responsibility of getting patients tested multiple times within 24 hours, as only 1% of records related to COVID come from other organizations in this data set.
+
+But this should still show one problem - if patients get tested multiple times in one place, there must be some flaws in this organization's systems or workflows, causing wastes in time and resources. In this way, we can say that the organization does not do its work well. However, when it comes to the situation that the patient is tested in different places, the reason behind this may be the loss in information transition between different organizations - which is much more understandable.
+
+### Other dimensions - test results changing within 24 hours
+
+```{r}
+patient_with_changing_result <- 0
+for (row in 1:(dim(within_24_hours_records)[1])){
+  if (within_24_hours_records$First_result[row] != within_24_hours_records$Second_result[row]){
+    patient_with_changing_result <- patient_with_changing_result + 1
+  }
+}
+patient_with_changing_result
+```
+
+```{r}
+within_24_hours_records$First_result[1]
+```
+
+For every patient who have multiple tests within 24 hours, the test results are all the same - not detected, which makes multiple testing more meaningless. 
+
+
+## Conclusion
+
+From the result above, we can see that 52.6% of the patients who have multiple records are tested within 24 hours. In these 24 hours, they are tested twice, and the average time between the two tests is around 20 hours. Also, 90% of them come to the hospital for COVID-19 for both of the two times, and their encounter class is mostly inpatient. There is no specific trend on these patients' gender and age.
+
+Moreover, 92.9% of the patients get their two tests in the same organization, and 100% of them have the same results for the two tests - not detected. These are very important dimensions to show the problem, since it indicates that the organization should take big responsibility for it. If there is nothing wrong with the workflows and systems adopted by the organizations, the lab system or the clinicians should have taken care of the test that is already been ordered and have reminded others of it, which prevents more than 1 test from being ordered for the same person, unless it is emergency. However, the unchanged results for the 2 tests does not show any necessity for ordering multiple tests within 24 hours.
+
+Therefore, to improve the problem stated above, a alert system should be built on openEMR - it should remind clinicians if the patients have already had a Covid test ordered within the last 24 hours. Also, there should be multiple ways to prevent hazards - just like what the Reason's Swiss Cheese Model indicates.

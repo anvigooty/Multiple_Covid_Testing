@@ -1,0 +1,38 @@
+SQL to create v_procedures:
+	CREATE VIEW v_procedures AS
+	SELECT po.patient_id AS pid,
+		po.procedure_order_id AS procedure_order_id,
+		po.date_collected AS date,
+		poc.procedure_code AS procedure_code,
+		poc.procedure_name AS procedure_name,
+		TIMESTAMPDIFF(HOUR,po.date_collected,current_timestamp()) AS proc_age,
+		CASE WHEN TIMESTAMPDIFF(HOUR,po.date_collected,current_timestamp()) > 24 THEN 0
+			 WHEN TIMESTAMPDIFF(HOUR,po.date_collected,current_timestamp()) <= 24 THEN 1
+			 END AS day_flag
+	FROM procedure_order AS po 
+	JOIN procedure_order_code AS poc
+		ON po.procedure_order_id = poc.procedure_order_id
+
+SQL to create v_covid:
+	CREATE VIEW v_covid AS
+	SELECT CONCAT('C-', id) AS procedure_order_id,
+		date,
+		pid,
+		test_status,
+		test_notes,
+		doctor,
+		procedure_code,
+		TIMESTAMPDIFF(HOUR,date,current_timestamp()) AS proc_age,
+		CASE WHEN TIMESTAMPDIFF(HOUR,date,current_timestamp()) > 24 THEN 0
+			 WHEN TIMESTAMPDIFF(HOUR,date,current_timestamp()) <= 24 THEN 1
+			 END AS day_flag
+	FROM form_covid_testing;
+	
+SQL to create v_covid_procedures:
+	CREATE VIEW v_covid_procedures AS
+	SELECT CAST(vp.procedure_order_id AS CHAR) AS procedure_id, pid, procedure_code, date, proc_age, day_flag
+		FROM v_procedures AS vp
+		WHERE vp.procedure_code = '19-1'
+	UNION ALL
+	SELECT vc.procedure_order_id AS procedure_id, pid, procedure_code, date, proc_age, day_flag
+		FROM v_covid AS vc;
